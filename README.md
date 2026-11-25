@@ -23,8 +23,8 @@ scripts/cycode_release_gate.py              The gate. Python standard library on
 
 - **The repository is connected to Cycode** through the GitHub integration.
 - **The platform scans your release branches.** Secrets scanning covers every branch. SCA, SAST and IaC scan the branches named in their branch scanning rules, so add a rule that matches your release branch names.
-- **A Cycode project that includes the repository, with its own PR settings.** On each scanner's tab in the project's PR settings, select **Project Settings** and set the status check severity. The gate returns NO-GO for a scanner that is left on the global settings.
-- **A Cycode service account for the pipeline.** A read-only role is enough. In testing, the Viewer role could read the results and request an on-demand scan.
+- **A Cycode project that includes the repository, with its own PR settings.** On each scanner's tab in the project's PR settings, select **Project Settings** and set the status check severity. 
+- **A Cycode service account for the pipeline.** A read-only role is sufficient. 
 
 ## Setup
 
