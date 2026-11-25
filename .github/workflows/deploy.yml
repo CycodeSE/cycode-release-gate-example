@@ -1,0 +1,42 @@
+# Example deployment pipeline. Run it by hand and name the release branch to deploy.
+# The deploy job runs only when the Cycode release gate returns GO.
+
+name: Deploy release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: 'Release branch to deploy, for example my-service-1.4.0'
+        type: string
+        required: true
+      trigger_scans:
+        description: 'Optional. Ask Cycode for a full scan first, for example sast'
+        type: string
+        default: ''
+      repository_scope:
+        description: 'Optional. Scanners counted across the whole repository, for example secrets'
+        type: string
+        default: ''
+
+jobs:
+  gate:
+    uses: ./.github/workflows/cycode-release-gate.yml
+    with:
+      branch: ${{ inputs.release_branch }}
+      projectId: ${{ vars.CYCODE_PROJECT_ID }}
+      triggerScans: ${{ inputs.trigger_scans }}
+      repositoryScope: ${{ inputs.repository_scope }}
+    secrets:
+      CYCODE_CLIENT_ID: ${{ secrets.CYCODE_CLIENT_ID }}
+      CYCODE_CLIENT_SECRET: ${{ secrets.CYCODE_CLIENT_SECRET }}
+
+  deploy:
+    name: Deploy to green
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy
+        env:
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+        run: echo "Gate returned GO. Deploying $RELEASE_BRANCH to green."

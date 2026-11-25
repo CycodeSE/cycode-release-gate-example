@@ -1,0 +1,146 @@
+# Cycode release gate (reusable workflow).
+#
+# Answers one question for a release branch: go or no-go.
+# No scan runs in the pipeline. The gate reads platform results through the Cycode API:
+#   1. waits until the Cycode platform shows completed SCA and IaC scans of the branch
+#   2. reads the thresholds from Cycode: the PR status-check minimum severity set on the
+#      Cycode project, per scanner. Each gated scanner must use Project Settings on that project.
+#      SCA dependencies and SCA licenses each have their own threshold, as in the console
+#   3. counts open violations on the branch at or above each threshold
+# The thresholds are owned by the security team in the Cycode console. Nothing here holds them.
+#
+# The gate does not evaluate until minAgeSeconds after the branch was pushed, and then waits until
+# the counts have stopped changing. Cycode gives no signal that findings are fully published, so
+# plan for 25 to 30 minutes between the push and an answer.
+#
+# Optional inputs:
+#   triggerScans: sast       requests a full SAST scan of the branch first and waits for it.
+#                            secrets is not accepted: that scan covers the whole repository
+#   repositoryScope: secrets counts a scanner across the whole repository instead of the branch
+#
+# Usage (same repository):
+#   jobs:
+#     gate:
+#       uses: ./.github/workflows/cycode-release-gate.yml
+#       with:
+#         branch: my-service-1.4.0
+#         projectId: ${{ vars.CYCODE_PROJECT_ID }}
+#       secrets:
+#         CYCODE_CLIENT_ID: ${{ secrets.CYCODE_CLIENT_ID }}
+#         CYCODE_CLIENT_SECRET: ${{ secrets.CYCODE_CLIENT_SECRET }}
+#
+# A missing or failed SCA or IaC scan, a missing threshold or an API error is a no-go.
+
+name: Cycode release gate
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 'Release branch to evaluate'
+        type: string
+        required: true
+      projectId:
+        description: 'Cycode project ID whose PR scanning thresholds define the gate. Each gated scanner must use Project Settings on that project'
+        type: string
+        required: true
+      scanners:
+        description: 'Thresholds that can block. Any of secrets,sca,licenses,sast,iac. sca is SCA dependencies, licenses is SCA licenses'
+        type: string
+        default: 'secrets,sca,licenses,sast,iac'
+      requireScans:
+        description: 'Scanners that must show a completed platform scan of the branch. SAST and Secrets push scans leave no scan record'
+        type: string
+        default: 'sca,iac'
+      triggerScans:
+        description: 'Optional. Scanners to scan on demand first, instead of relying on branch scanning rules. Not secrets'
+        type: string
+        default: ''
+      repositoryScope:
+        description: 'Optional. Scanners counted across the whole repository instead of the branch, for example secrets'
+        type: string
+        default: ''
+      minAgeSeconds:
+        description: 'Do not evaluate until this long after the branch was pushed'
+        type: number
+        default: 1200
+      waitTimeoutSeconds:
+        description: 'Total time the gate may wait before it returns NO-GO'
+        type: number
+        default: 2700
+      repositoryId:
+        description: 'GitHub repository node ID (R_kgDO...). Defaults to the calling repository'
+        type: string
+        default: ''
+      runsOn:
+        description: 'Runner label'
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      CYCODE_CLIENT_ID:
+        required: true
+      CYCODE_CLIENT_SECRET:
+        required: true
+    outputs:
+      result:
+        description: 'GO or NO-GO'
+        value: ${{ jobs.gate.outputs.result }}
+
+jobs:
+  gate:
+    name: Cycode release gate
+    runs-on: ${{ inputs.runsOn }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.gate.outputs.result }}
+    steps:
+      # The gate script lives on the default branch, next to this workflow.
+      - name: Check out the gate script
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+
+      # Time of the last push to the branch. The head commit can be older than the push,
+      # so the commit date alone would let the gate evaluate too early.
+      - name: Look up when the release branch was pushed
+        id: pushed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          committed=$(gh api "repos/${GITHUB_REPOSITORY}/commits/heads/${BRANCH}" --jq .commit.committer.date)
+          pushed=$(gh api "repos/${GITHUB_REPOSITORY}/activity?ref=refs/heads/${BRANCH}&per_page=1" --jq '.[0].timestamp // empty' 2>/dev/null || true)
+          at="${pushed:-$committed}"
+          # UTC ISO timestamps sort as text. Use the later of the two.
+          if [[ "$committed" > "$at" ]]; then at="$committed"; fi
+          echo "Branch ${BRANCH}: head committed ${committed}, last push ${pushed:-unknown}, using ${at}"
+          echo "at=${at}" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate the release gate
+        id: gate
+        env:
+          CYCODE_CLIENT_ID: ${{ secrets.CYCODE_CLIENT_ID }}
+          CYCODE_CLIENT_SECRET: ${{ secrets.CYCODE_CLIENT_SECRET }}
+          GATE_REPO_ID: ${{ inputs.repositoryId || github.event.repository.node_id }}
+          GATE_REPO_NAME: ${{ github.repository }}
+          GATE_BRANCH: ${{ inputs.branch }}
+          GATE_PROJECT_ID: ${{ inputs.projectId }}
+          GATE_SCANNERS: ${{ inputs.scanners }}
+          GATE_REQUIRE_SCANS: ${{ inputs.requireScans }}
+          GATE_TRIGGER_SCANS: ${{ inputs.triggerScans }}
+          GATE_REPOSITORY_SCOPE: ${{ inputs.repositoryScope }}
+          GATE_WAIT_TIMEOUT: ${{ inputs.waitTimeoutSeconds }}
+          GATE_PUSHED_AT: ${{ steps.pushed.outputs.at }}
+          GATE_MIN_AGE: ${{ inputs.minAgeSeconds }}
+        run: python3 scripts/cycode_release_gate.py --json-out "$RUNNER_TEMP/cycode-release-gate.json"
+
+      - name: Upload the gate result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cycode-release-gate
+          path: ${{ runner.temp }}/cycode-release-gate.json
+          if-no-files-found: ignore
