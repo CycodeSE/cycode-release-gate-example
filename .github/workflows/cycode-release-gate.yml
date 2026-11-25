@@ -6,7 +6,8 @@
 #   2. reads the thresholds from Cycode: the PR status-check minimum severity set on the
 #      Cycode project, per scanner. Each gated scanner must use Project Settings on that project.
 #      SCA dependencies and SCA licenses each have their own threshold, as in the console
-#   3. counts open violations on the branch at or above each threshold
+#   3. counts open violations on the branch at or above each threshold. Secrets are the
+#      repository's open secrets whose commit is in the branch's history (secretsBy: history)
 # The thresholds are owned by the security team in the Cycode console. Nothing here holds them.
 #
 # The gate does not evaluate until minAgeSeconds after the branch was pushed, and then waits until
@@ -17,6 +18,7 @@
 #   triggerScans: sast       requests a full SAST scan of the branch first and waits for it.
 #                            secrets is not accepted: that scan covers the whole repository
 #   repositoryScope: secrets counts a scanner across the whole repository instead of the branch
+#   secretsBy: branch        counts only the secrets Cycode records against the branch
 #
 # Usage (same repository):
 #   jobs:
@@ -60,6 +62,10 @@ on:
         description: 'Optional. Scanners counted across the whole repository instead of the branch, for example secrets'
         type: string
         default: ''
+      secretsBy:
+        description: 'history counts open secrets whose commit is in the branch history. branch counts the secrets Cycode records against the branch'
+        type: string
+        default: 'history'
       minAgeSeconds:
         description: 'Do not evaluate until this long after the branch was pushed'
         type: number
@@ -132,6 +138,8 @@ jobs:
           GATE_REQUIRE_SCANS: ${{ inputs.requireScans }}
           GATE_TRIGGER_SCANS: ${{ inputs.triggerScans }}
           GATE_REPOSITORY_SCOPE: ${{ inputs.repositoryScope }}
+          GATE_SECRETS_BY: ${{ inputs.secretsBy }}
+          GITHUB_TOKEN: ${{ github.token }}  # read-only, to ask GitHub whether a commit is in the branch
           GATE_WAIT_TIMEOUT: ${{ inputs.waitTimeoutSeconds }}
           GATE_PUSHED_AT: ${{ steps.pushed.outputs.at }}
           GATE_MIN_AGE: ${{ inputs.minAgeSeconds }}

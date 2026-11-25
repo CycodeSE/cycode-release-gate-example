@@ -9,6 +9,7 @@ No scan runs in the pipeline. The gate only reads platform results through the C
                    scanner must use Project Settings on that project. SCA dependencies and
                    SCA licenses each have their own threshold.
   3. Violations    Count open violations on the branch at or above each threshold.
+                   Secrets are matched to the branch by commit history. See --secrets-by.
 
 Exit codes
   0  GO      every gated scanner has zero open violations at or above its threshold
@@ -27,6 +28,10 @@ Notes
     branch and waits for it.
   - --trigger-scans does not accept secrets. An on-demand Secrets scan covers the whole
     repository, not one branch.
+  - Cycode records a secret against the commit that added it and the branch where that commit
+    was first pushed. A release branch that shares history with an earlier branch holds the
+    same secrets. The gate therefore lists the repository's open secrets and keeps those whose
+    commit is in the branch's history, which it asks GitHub (GITHUB_TOKEN or GH_TOKEN).
 
 Python standard library only. Credentials come from CYCODE_CLIENT_ID / CYCODE_CLIENT_SECRET.
 """
@@ -40,6 +45,7 @@ import urllib.parse
 import urllib.request
 
 API = os.environ.get("CYCODE_API_URL", "https://api.cycode.com").rstrip("/")
+GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 SEVERITIES = ["Info", "Low", "Medium", "High", "Critical"]  # ascending
 # gate key -> (PR settings scan_type, scans API scan_type, violations API category, display name)
 SCANNERS = {
@@ -113,6 +119,50 @@ class Api:
             except ValueError:
                 return code, raw
         raise GateError(f"{method} {path} kept failing (last HTTP {code})")
+
+
+class History:
+    """Is a commit in the branch's history? Answered by GitHub's compare API, once per commit."""
+
+    def __init__(self, repo_name, branch):
+        self.token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+        self.repo, self.branch, self.cache = repo_name or "", branch, {}
+        if not self.token or self.repo.count("/") != 1:
+            raise GateError("matching Secrets by commit history needs --repo-name owner/repo and a GitHub token in "
+                            "GITHUB_TOKEN or GH_TOKEN. --secrets-by branch counts by the recorded branch instead")
+        # The branch must resolve, or a 404 from compare could not be read as "commit not in this branch".
+        code, _ = self._get(f"/repos/{self.repo}/git/ref/heads/{urllib.parse.quote(branch)}")
+        if code != 200:
+            raise GateError(f"GitHub could not find branch {branch} in {self.repo} (HTTP {code})")
+
+    def _get(self, path):
+        code = 599
+        for attempt in range(4):
+            req = urllib.request.Request(GITHUB_API + path, headers={
+                "Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    return r.status, json.load(r)
+            except urllib.error.HTTPError as e:
+                code = e.code
+                if code not in (403, 429, 500, 502, 503, 504):
+                    return code, None
+            except urllib.error.URLError:
+                code = 599
+            time.sleep(5 * (attempt + 1))
+        raise GateError(f"GitHub API kept failing (last HTTP {code})")
+
+    def contains(self, commit):
+        if commit not in self.cache:
+            q = urllib.parse.quote
+            code, data = self._get(f"/repos/{self.repo}/compare/{q(commit, safe='')}...{q(self.branch, safe='')}?per_page=1")
+            if code == 200:
+                self.cache[commit] = (data or {}).get("status") in ("ahead", "identical")
+            elif code == 404:  # the commit is not in the repository, or shares no history with the branch
+                self.cache[commit] = False
+            else:
+                raise GateError(f"GitHub could not compare a commit with branch {self.branch} (HTTP {code})")
+        return self.cache[commit]
 
 
 def at_or_above(threshold):
@@ -238,11 +288,44 @@ def sca_open_by_kind(api, repo_id, branch):
     return out, len(seen)
 
 
-def read_counts(api, repo_id, branch, gated, repo_scope=()):
+def secrets_open_in_history(api, repo_id, branch, history):
+    """Open secrets in the repository whose commit is in the branch's history, per severity.
+
+    Returns (per severity, secrets listed, secrets that could not be placed).
+    """
+    out, seen, unplaced, token = dict.fromkeys(SEVERITIES, 0), set(), 0, None
+    while True:
+        params = [("repository_ids", repo_id), ("category", "SecretDetection"), ("status", "Open"), ("page_size", 100)]
+        if token:
+            params.append(("next_page_token", token))
+        code, data = api.call("GET", "/v4/violations", params)
+        if code != 200 or not isinstance(data, dict):
+            raise GateError(f"could not list Secrets violations (HTTP {code})")
+        for v in data.get("items", []):
+            if v.get("id") in seen:
+                continue
+            seen.add(v.get("id"))
+            details = v.get("detection_details") or {}
+            if details.get("commit_id"):
+                here = history.contains(details["commit_id"])
+            elif details.get("branch_name"):
+                here = details["branch_name"] == branch
+            else:  # no commit and no branch: it cannot be placed, so it counts
+                here, unplaced = True, unplaced + 1
+            if here and v.get("severity") in SEVERITIES:
+                out[v["severity"]] += 1
+        token = data.get("next_page_token")
+        if not token or not data.get("items"):
+            break
+    return out, len(seen), unplaced
+
+
+def read_counts(api, repo_id, branch, gated, repo_scope=(), history=None):
     """Open violations per severity, plus violations in any status, for each gated scanner.
 
     Scanners in repo_scope are counted across the whole repository instead of the branch.
-    Returns (counts, consistent). consistent is False when the SCA list and the SCA count disagree,
+    With history, Secrets are the repository's open secrets whose commit is in the branch's history.
+    Returns (counts, consistent). consistent is False when a list and its count disagree,
     which happens while findings are being ingested.
     """
     out, consistent = {}, True
@@ -254,18 +337,24 @@ def read_counts(api, repo_id, branch, gated, repo_scope=()):
             if key in SCA_KEYS:
                 out[key] = {"open": split[key], "any_status": any_status}
     for key in gated:
-        if key not in SCA_KEYS:
+        if key == "secrets" and history and key not in repo_scope:
+            by_severity, listed, unplaced = secrets_open_in_history(api, repo_id, branch, history)
+            consistent = consistent and listed == count(api, repo_id, None, "SecretDetection")
+            out[key] = {"open": by_severity, "any_status": count(api, repo_id, None, "SecretDetection", status=None),
+                        "repository_open": listed, "unplaced": unplaced}
+        elif key not in SCA_KEYS:
             category, where = SCANNERS[key][2], (None if key in repo_scope else branch)
             out[key] = {"open": {sev: count(api, repo_id, where, category, sev) for sev in SEVERITIES},
                         "any_status": count(api, repo_id, where, category, status=None)}
     return out, consistent
 
 
-def settled_counts(api, repo_id, branch, gated, latest, deadline, interval, readings, stable_seconds, repo_scope=()):
+def settled_counts(api, repo_id, branch, gated, latest, deadline, interval, readings, stable_seconds,
+                   repo_scope=(), history=None):
     """Read counts until they are published and have stayed unchanged for stable_seconds."""
     previous, streak, since = None, 0, time.time()
     while True:
-        counts, consistent = read_counts(api, repo_id, branch, gated, repo_scope)
+        counts, consistent = read_counts(api, repo_id, branch, gated, repo_scope, history)
         unpublished = sorted({SCANNERS[k][1] for k in gated
                               if ((latest.get(SCANNERS[k][1]) or {}).get("results_count") or 0) > 0
                               and counts[k]["any_status"] == 0})
@@ -300,7 +389,7 @@ def wait_min_age(pushed_at, min_age, deadline):
         time.sleep(remaining)
 
 
-def write_summary(path, title, rows, result, reason, project_id):
+def write_summary(path, title, rows, result, reason, project_id, note=""):
     lines = [f"## Cycode release gate: {result}", "", title, "",
              f"Thresholds read from Cycode: the PR settings of project `{project_id}`. "
              "Counts are open violations on this branch.", "",
@@ -311,7 +400,7 @@ def write_summary(path, title, rows, result, reason, project_id):
         lines.append(f"| {r['name']} | {r['threshold']} and above | {r['scan']} | "
                      f"{c['Critical']} | {c['High']} | "
                      f"{c['Medium']} | {c['Low']} | {c['Info']} | **{r['blocking']}** |")
-    lines += ["", reason, ""]
+    lines += ["", reason, ""] + ([note, ""] if note else [])
     with open(path, "a", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
@@ -347,6 +436,11 @@ def main():
     ap.add_argument("--repository-scope", default=env("GATE_REPOSITORY_SCOPE", ""),
                     help="Optional. Scanners counted across the whole repository instead of the branch, "
                          "for example secrets.")
+    ap.add_argument("--secrets-by", default=env("GATE_SECRETS_BY", "history"),
+                    help="history (default): open secrets in the repository whose commit is in the branch's history. "
+                         "Needs --repo-name owner/repo and a GitHub token in GITHUB_TOKEN or GH_TOKEN. "
+                         "branch: open secrets Cycode records against the branch, which leaves out secrets "
+                         "the branch inherited from an earlier branch.")
     ap.add_argument("--json-out", default=env("GATE_JSON_OUT", ""), help="Optional path for a machine-readable result.")
     a = ap.parse_args()
 
@@ -362,14 +456,18 @@ def main():
             ap.error(f"--{name.replace('_', '-')} is required")
     gated, required, triggered = keys(a.scanners), keys(a.require_scans), keys(a.trigger_scans)
     repo_scope = [k for k in keys(a.repository_scope) if k not in SCA_KEYS]
+    if a.secrets_by not in ("history", "branch"):
+        ap.error("--secrets-by must be history or branch")
+    by_history = a.secrets_by == "history" and "secrets" in gated and "secrets" not in repo_scope
     if "secrets" in triggered:  # that scan is repository-wide, so it cannot answer for one branch
         ap.error("--trigger-scans secrets is not supported. An on-demand Secrets scan covers the whole repository, "
                  "not one branch")
     title = f"`{a.repo_name or a.repo_id}` at branch `{a.branch}`"
     print(f"Cycode release gate: {a.repo_name or a.repo_id} @ {a.branch}")
-    rows, result, reason, code = [], "NO-GO", "", 2
+    rows, result, reason, code, note = [], "NO-GO", "", 2, ""
     try:
         api = Api()
+        history = History(a.repo_name, a.branch) if by_history else None
         thresholds = read_thresholds(api, a.project_id, gated)
         print("  thresholds from Cycode project " + str(a.project_id) + ": " +
               ", ".join(f"{SCANNERS[k][3]}>={v}" for k, v in thresholds.items()))
@@ -388,7 +486,13 @@ def main():
                                 a.poll_interval, not_before) \
             if required else latest_scans(api, a.repo_id, a.branch)
         settled = settled_counts(api, a.repo_id, a.branch, gated, latest, deadline, a.poll_interval,
-                                 max(2, a.stable_readings), max(0, a.stable_seconds), repo_scope)
+                                 max(2, a.stable_readings), max(0, a.stable_seconds), repo_scope, history)
+        if by_history:
+            s = settled["secrets"]
+            note = (f"Secrets: {sum(s['open'].values())} of the repository's {s['repository_open']} open secrets "
+                    "are on commits in this branch's history.")
+            if s["unplaced"]:
+                note += f" {s['unplaced']} carry no commit or branch and are counted."
         for key in gated:
             _, scan_type, _, name = SCANNERS[key]
             counts = settled[key]["open"]
@@ -415,15 +519,18 @@ def main():
             print(f"  {r['name']:16} {r['threshold']:10} {r['scan']:24} "
                   f"{c['Critical']:>5} {c['High']:>5} {c['Medium']:>5} "
                   f"{c['Low']:>5} {c['Info']:>5} {r['blocking']:>9}")
+    if note:
+        print(f"\n  {note}")
     print(f"\nResult: {result}. {reason}")
 
     out = {"result": result, "exit_code": code, "reason": reason, "repository_id": a.repo_id, "branch": a.branch,
-           "project_id": str(a.project_id), "scanners": rows}
+           "project_id": str(a.project_id), "secrets_by": "repository" if "secrets" in repo_scope else a.secrets_by,
+           "scanners": rows}
     if a.json_out:
         with open(a.json_out, "w", encoding="utf-8") as fh:
             json.dump(out, fh, indent=2)
     if env("GITHUB_STEP_SUMMARY"):
-        write_summary(env("GITHUB_STEP_SUMMARY"), title, rows, result, reason, a.project_id)
+        write_summary(env("GITHUB_STEP_SUMMARY"), title, rows, result, reason, a.project_id, note)
     if env("GITHUB_OUTPUT"):
         with open(env("GITHUB_OUTPUT"), "a", encoding="utf-8") as fh:
             fh.write(f"result={result}\nblocking={sum(r['blocking'] for r in rows)}\n")

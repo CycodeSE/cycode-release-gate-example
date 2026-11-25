@@ -8,7 +8,7 @@ A go or no-go check for a release branch, built on the Cycode API. Nothing is sc
 
 1. **Wait for the platform scans.** The gate waits until Cycode shows a completed SCA and IaC scan of the branch.
 2. **Read the thresholds from Cycode.** It reads the PR status check severity set on a Cycode project, one per scanner: Secrets, SCA dependencies, SCA licenses, SAST and IaC. The pipeline holds no thresholds. A change in the Cycode console applies on the next run.
-3. **Count open violations on the branch.** For each scanner it counts open violations at or above the threshold. Ignored and resolved violations are not counted.
+3. **Count open violations on the branch.** For each scanner it counts open violations at or above the threshold. Ignored and resolved violations are not counted. Secrets are matched to the branch by commit history. See [How Secrets are matched to a branch](#how-secrets-are-matched-to-a-branch).
 4. **Answer.** GO when every count is zero. NO-GO when a count is above zero, or when the gate cannot evaluate: a scan is missing or failed, a threshold is not set, or the API returns an error.
 
 ## Repo layout
@@ -63,6 +63,7 @@ A NO-GO fails the `gate` job, so `deploy` is skipped. The run summary shows the 
 | `requireScans` | `sca,iac` | Scanners that must show a completed platform scan of the branch. |
 | `triggerScans` | empty | Scanners to scan on demand before evaluating: `sast`, `sca`, `iac`. |
 | `repositoryScope` | empty | Scanners counted across the whole repository instead of the branch, for example `secrets`. |
+| `secretsBy` | `history` | `history` counts the open secrets whose commit is in the branch's history. `branch` counts only the secrets Cycode records against the branch. |
 | `minAgeSeconds` | `1200` | The gate does not evaluate until this long after the branch was pushed. |
 | `waitTimeoutSeconds` | `2700` | Total time the gate may wait before it returns NO-GO. |
 | `repositoryId` | calling repository | GitHub repository node ID (`R_kgDO...`). |
@@ -72,7 +73,7 @@ The workflow has one output, `result`, which is `GO` or `NO-GO`.
 
 ## Running the script directly
 
-Set `CYCODE_CLIENT_ID` and `CYCODE_CLIENT_SECRET` in the environment, then:
+Set `CYCODE_CLIENT_ID` and `CYCODE_CLIENT_SECRET` in the environment. Also set `GITHUB_TOKEN` or `GH_TOKEN` to a token that can read the repository, which the gate uses to match Secrets to the branch. Then:
 
 ```bash
 python3 scripts/cycode_release_gate.py \
@@ -100,6 +101,23 @@ Cycode gives no signal that a scan's findings are fully published. A scan can sh
 
 In testing, findings were fully published 13 to 25 minutes after a push. Plan for 25 to 30 minutes between pushing a release branch and an answer.
 
+## How Secrets are matched to a branch
+
+Cycode records a secret against the commit that added it and the branch where that commit was first pushed. A release branch that shares history with an earlier branch holds the same secrets, but they stay recorded against the earlier branch. A count on the recorded branch alone would leave them out.
+
+The gate therefore works from the repository's open secrets:
+
+1. It lists the open secrets in the repository.
+2. For each commit those secrets were added in, it asks GitHub whether the commit is in the release branch's history. That is one request per commit.
+3. It counts the secrets whose commit is in the branch.
+
+Things to know:
+
+- **It needs a GitHub token with read access.** The workflow passes its own `github.token`. Without a token the gate returns NO-GO.
+- **It follows history, not the current files.** A secret added by an earlier commit and removed by a later one still counts while Cycode shows it as open.
+- **`secretsBy: branch`** counts only the secrets Cycode records against the branch. **`repositoryScope: secrets`** counts every open secret in the repository.
+- **Outside GitHub** the same check is `git merge-base --is-ancestor <commit> <branch>` in a clone of the repository.
+
 ## Thresholds and exceptions
 
 - **A threshold is a severity floor for one scanner.** The gate allows no open violations at that severity or above.
@@ -117,7 +135,7 @@ In testing, findings were fully published 13 to 25 minutes after a push. Plan fo
 
 ## API endpoints used
 
-All are in the Cycode API reference.
+The Cycode endpoints are all in the Cycode API reference.
 
 | Endpoint | Used for |
 |---|---|
@@ -126,7 +144,9 @@ All are in the Cycode API reference.
 | `POST /v4/scans` | On-demand scan, only with `triggerScans` |
 | `GET /v4/scans/pull-request-scoped-settings/Project/{projectId}` | Thresholds from the project's PR settings |
 | `GET /v4/violations/count` | Open violation counts by severity |
-| `GET /v4/violations` | Split of SCA findings into dependencies and licenses |
+| `GET /v4/violations` | Split of SCA findings into dependencies and licenses, and the repository's open secrets with their commits |
+
+The gate also calls two GitHub REST endpoints with the workflow's token: `GET /repos/{owner}/{repo}/git/ref/heads/{branch}` and `GET /repos/{owner}/{repo}/compare/{commit}...{branch}`.
 
 ## Using it across repositories
 
